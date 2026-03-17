@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CS2 Asset Pack Exporter",
     "author": "CS2 Modding Tool",
-    "version": (2, 0, 0),
+    "version": (2, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > CS2 Export",
     "description": "Export Blender collections as CS2-ready asset packs",
@@ -15,6 +15,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import shutil
 import numpy as np
 from bpy.props import (
     StringProperty, BoolProperty, EnumProperty,
@@ -25,7 +26,7 @@ from bpy.types import Panel, Operator, PropertyGroup, AddonPreferences
 
 
 # ===========================================================================
-# ADDON PREFERENCES  (default export folder stored here, not per-scene)
+# ADDON PREFERENCES
 # ===========================================================================
 
 class CS2ExporterPreferences(AddonPreferences):
@@ -41,8 +42,7 @@ class CS2ExporterPreferences(AddonPreferences):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "default_export_folder")
-        layout.label(text="This folder is used when no pack-specific folder is set.",
-                     icon="INFO")
+        layout.label(text="This folder is used when no pack-specific folder is set.", icon="INFO")
 
 
 # ===========================================================================
@@ -50,7 +50,6 @@ class CS2ExporterPreferences(AddonPreferences):
 # ===========================================================================
 
 def _on_export_mode_update(self, context):
-    """Auto-create age stage sub-collections when Aging Tree mode is selected."""
     if self.export_mode != "AGING_TREE":
         return
     col = bpy.data.collections.get(self.name)
@@ -71,7 +70,6 @@ class CS2CollectionIgnore(PropertyGroup):
         items=[
             ("VARIANTS",       "Variants",          "Each mesh in its own subfolder (for CS2 mesh variations)"),
             ("SINGLE_MESH",    "Single Mesh",        "Merge all meshes into one FBX (single material)"),
-            ("SPLIT_MATERIAL", "Split per Material", "One FBX per material slot, shared folder"),
             ("AGING_TREE",     "Aging Tree",         "Child collections mapped to CS2 tree age stages (Child/Teen/Adult/Elderly/Dead/Stump)"),
         ],
         default="VARIANTS",
@@ -84,12 +82,10 @@ def _sync_ignore_list(context):
     scene_cols  = {c.name for c in context.scene.collection.children
                    if any(o.type == "MESH" for o in c.objects)}
     existing    = {e.name for e in ignore_list}
-
     for name in scene_cols:
         if name not in existing:
             e      = ignore_list.add()
             e.name = name
-
     stale = [e.name for e in ignore_list if e.name not in scene_cols]
     for name in stale:
         idx = next((i for i, e in enumerate(ignore_list) if e.name == name), None)
@@ -105,50 +101,25 @@ def _is_ignored(context, col_name):
 
 
 # ===========================================================================
-# SCENE SETTINGS  (pack name + optional folder override)
+# SCENE SETTINGS
 # ===========================================================================
 
 class CS2PackSettings(PropertyGroup):
-
-    pack_name: StringProperty(
-        name="Pack Name",
-        description="Name of the asset pack (output folder name)",
-        default="MyAssetPack",
-    )
-    export_folder_override: StringProperty(
-        name="Export Folder (override)",
-        description="Leave empty to use the default folder from addon preferences",
-        default="",
-        subtype="DIR_PATH",
-    )
+    pack_name: StringProperty(name="Pack Name", description="Name of the asset pack (output folder name)", default="MyAssetPack")
+    export_folder_override: StringProperty(name="Export Folder (override)", description="Leave empty to use the default folder from addon preferences", default="", subtype="DIR_PATH")
     texture_size: EnumProperty(
         name="Texture Size",
-        items=[
-            ("512",  "512 px",  ""),
-            ("1024", "1024 px", ""),
-            ("2048", "2048 px", "Recommended"),
-            ("4096", "4096 px", "Max CS2"),
-        ],
+        items=[("512","512 px",""),("1024","1024 px",""),("2048","2048 px","Recommended"),("4096","4096 px","Max CS2")],
         default="2048",
     )
-    ao_samples: IntProperty(
-        name="AO Samples",
-        description="Cycles samples for AO bake",
-        default=32, min=4, max=512, step=4,
-    )
-    export_fbx: BoolProperty(name="Export FBX",      default=True)
+    export_fbx: BoolProperty(name="Export FBX", default=True)
     export_textures: BoolProperty(name="Export Textures", default=True)
-    do_decimate: BoolProperty(name="Auto Decimate",   default=False)
-    polys_per_m3: FloatProperty(
-        name="Polys / m³", default=2000.0, min=10.0, max=500000.0, step=100,
-    )
-    max_tris: IntProperty(
-        name="Max Triangles", default=10000, min=100, max=200000, step=500,
-    )
+    do_decimate: BoolProperty(name="Auto Decimate", default=False)
+    polys_per_m3: FloatProperty(name="Polys / m³", default=2000.0, min=10.0, max=500000.0, step=100)
+    max_tris: IntProperty(name="Max Triangles", default=10000, min=100, max=200000, step=500)
 
 
 def _resolve_export_folder(context):
-    """Return the active export folder: override → preferences → ''."""
     s = context.scene.cs2_pack_settings
     if s.export_folder_override.strip():
         return bpy.path.abspath(s.export_folder_override)
@@ -163,7 +134,6 @@ def _resolve_export_folder(context):
 # ===========================================================================
 
 def _sanitize(name):
-    """Remove underscores so CS2 name parser doesn't choke."""
     base = re.sub(r'_?LOD\d+$', '', name, flags=re.IGNORECASE)
     return base.replace('_', '')
 
@@ -176,36 +146,22 @@ AGING_TREE_STAGES = {"Child", "Teen", "Adult", "Elderly", "Dead", "Stump"}
 
 
 def _base_stage_name(name):
-    """Strip Blender duplicate suffix: 'Child.001' -> 'Child'"""
-    import re as _re
-    return _re.sub(r'\.\d+$', '', name)
+    return re.sub(r'\.\d+$', '', name)
 
 
 def _validate_aging_tree(collection):
-    """
-    Check that a collection set up for Aging Tree export has valid child collections.
-    Returns (valid, errors) where errors is a list of strings.
-    """
     errors = []
-    child_cols = list(collection.children)
-
-    if not child_cols:
+    if not list(collection.children):
         errors.append(f"'{collection.name}' has no child collections.")
         return False, errors
-
-    for col in child_cols:
-        base = _base_stage_name(col.name)
-        if base not in AGING_TREE_STAGES:
-            errors.append(
-                f"Invalid stage name '{col.name}'. "
-                f"Must be one of: {', '.join(sorted(AGING_TREE_STAGES))}"
-            )
-
+    for col in collection.children:
+        if _base_stage_name(col.name) not in AGING_TREE_STAGES:
+            errors.append(f"Invalid stage name '{col.name}'. Must be one of: {', '.join(sorted(AGING_TREE_STAGES))}")
     return len(errors) == 0, errors
 
 
 # ===========================================================================
-# TEXTURE EXTRACTION
+# TEXTURE EXTRACTION (used by worker via exec)
 # ===========================================================================
 
 def _get_principled(material):
@@ -240,17 +196,12 @@ def _get_textures(material):
     result = {"base_color": None, "normal": None, "roughness": None, "metallic": None}
     if not material or not material.use_nodes:
         return result
-
-    # Strategy 1: Principled BSDF sockets
     bsdf = _get_principled(material)
     if bsdf:
-        for key, sock in [("base_color","Base Color"),("roughness","Roughness"),
-                          ("metallic","Metallic"),("normal","Normal")]:
+        for key, sock in [("base_color","Base Color"),("roughness","Roughness"),("metallic","Metallic"),("normal","Normal")]:
             s = bsdf.inputs.get(sock)
             if s:
                 result[key] = _image_from_socket(s)
-
-    # Strategy 2: frame label / filename keywords (Poly Haven etc.)
     kw_map = {
         "base_color": ["base color","basecolor","albedo","diffuse","diff","color","_bc","_d."],
         "normal":     ["normal","nrm","nor_gl","nor_dx","_nor","_n.","_nm"],
@@ -261,7 +212,6 @@ def _get_textures(material):
     for node in material.node_tree.nodes:
         if node.parent and node.parent.type == "FRAME":
             node_frame[node.name] = node.parent.label.lower()
-
     for node in material.node_tree.nodes:
         if node.type != "TEX_IMAGE" or not node.image:
             continue
@@ -274,21 +224,11 @@ def _get_textures(material):
                 if kw in frame or kw in img_nm:
                     result[key] = node.image
                     break
-
     return result
 
 
-def _first_material(collection):
-    for obj in collection.objects:
-        if obj.type == "MESH" and obj.data.materials:
-            mat = obj.data.materials[0]
-            if mat:
-                return mat
-    return None
-
-
 # ===========================================================================
-# TEXTURE SAVING
+# TEXTURE SAVING (used by worker via exec)
 # ===========================================================================
 
 def _px_to_np(image, w, h):
@@ -308,89 +248,24 @@ def _save_png(pixels, filepath, w, h):
     bpy.data.images.remove(img)
 
 
-def _save_textures(textures, ao_image, asset_name, asset_dir, tex_size):
+def _save_textures(textures, asset_name, asset_dir, tex_size):
     w = h = tex_size
-    saved = []
-
     if textures["base_color"]:
-        fp = os.path.join(asset_dir, f"{asset_name}_BaseColor.png")
-        _save_png(_px_to_np(textures["base_color"], w, h), fp, w, h)
-        saved.append(fp)
-
+        _save_png(_px_to_np(textures["base_color"], w, h), os.path.join(asset_dir, f"{asset_name}_BaseColor.png"), w, h)
     if textures["normal"]:
-        fp = os.path.join(asset_dir, f"{asset_name}_Normal.png")
-        _save_png(_px_to_np(textures["normal"], w, h), fp, w, h)
-        saved.append(fp)
-
-    mask = np.ones((h, w, 4), dtype=np.float32)
-    mask[:,:,0] = _px_to_np(textures["metallic"],  w, h)[:,:,0] if textures["metallic"]  else 0.0
-    mask[:,:,1] = _px_to_np(ao_image,              w, h)[:,:,0] if ao_image               else 1.0
-    mask[:,:,2] = 1.0
+        _save_png(_px_to_np(textures["normal"], w, h), os.path.join(asset_dir, f"{asset_name}_Normal.png"), w, h)
+    # MaskMap: R=Metallic, G=Coat(0), B=Black(unused), A=Glossiness(1-Roughness)
+    mask = np.zeros((h, w, 4), dtype=np.float32)
+    mask[:,:,0] = _px_to_np(textures["metallic"], w, h)[:,:,0] if textures["metallic"] else 0.0
+    mask[:,:,1] = 0.0
+    mask[:,:,2] = 0.0
     mask[:,:,3] = (1.0 - _px_to_np(textures["roughness"], w, h)[:,:,0]) if textures["roughness"] else 0.5
-
-    fp = os.path.join(asset_dir, f"{asset_name}_MaskMap.png")
-    _save_png(mask, fp, w, h)
-    saved.append(fp)
-
-    fp = os.path.join(asset_dir, f"{asset_name}_ControlMask.png")
-    _save_png(np.ones((h, w, 4), dtype=np.float32), fp, w, h)
-    saved.append(fp)
-
-    return saved
+    _save_png(mask, os.path.join(asset_dir, f"{asset_name}_MaskMap.png"), w, h)
+    _save_png(np.ones((h, w, 4), dtype=np.float32), os.path.join(asset_dir, f"{asset_name}_ControlMask.png"), w, h)
 
 
 # ===========================================================================
-# AO BAKE
-# ===========================================================================
-
-def _bake_ao(mesh_objects, asset_name, tex_size, samples, report_fn):
-    report_fn(f"INFO: Baking AO '{asset_name}' ({samples} samples)...")
-    orig_engine  = bpy.context.scene.render.engine
-    orig_samples = bpy.context.scene.cycles.samples
-    bpy.context.scene.render.engine  = "CYCLES"
-    bpy.context.scene.cycles.samples = samples
-
-    ao_img = bpy.data.images.new(f"{asset_name}_AO", tex_size, tex_size, alpha=False)
-    ao_img.colorspace_settings.name = "Non-Color"
-
-    temp_nodes = []
-    for obj in mesh_objects:
-        for mat in (obj.data.materials or []):
-            if not mat or not mat.use_nodes:
-                continue
-            node = mat.node_tree.nodes.new("ShaderNodeTexImage")
-            node.image = ao_img
-            node.name  = "__CS2_AO__"
-            mat.node_tree.nodes.active = node
-            temp_nodes.append((mat, node))
-
-    bpy.ops.object.select_all(action="DESELECT")
-    for obj in mesh_objects:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = mesh_objects[0]
-
-    try:
-        bpy.ops.object.bake(type="AO", use_clear=True)
-        success = True
-    except Exception as e:
-        report_fn(f"WARNING: AO bake failed: {e}")
-        success = False
-
-    for mat, node in temp_nodes:
-        mat.node_tree.nodes.remove(node)
-
-    bpy.context.scene.render.engine  = orig_engine
-    bpy.context.scene.cycles.samples = orig_samples
-    bpy.ops.object.select_all(action="DESELECT")
-
-    if not success:
-        bpy.data.images.remove(ao_img)
-        return None
-    return ao_img
-
-
-# ===========================================================================
-# DECIMATION
+# DECIMATION (used by worker via exec)
 # ===========================================================================
 
 def _volume_m3(obj):
@@ -424,18 +299,15 @@ def _decimate(obj, polys_per_m3, max_tris, report_fn):
 
 
 # ===========================================================================
-# FBX EXPORT  (single object, non-destructive)
+# FBX EXPORT (used by worker via exec)
 # ===========================================================================
 
 def _export_fbx(obj, fbx_path):
-    """Export one object. Scale is handled via global_scale=100."""
     orig_hide = obj.hide_viewport
     obj.hide_viewport = False
-
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-
     bpy.ops.export_scene.fbx(
         filepath=fbx_path,
         use_selection=True,
@@ -451,7 +323,9 @@ def _export_fbx(obj, fbx_path):
         axis_forward="-Z",
         axis_up="Y",
     )
-
+    fbm_path = os.path.splitext(fbx_path)[0] + ".fbm"
+    if os.path.isdir(fbm_path):
+        shutil.rmtree(fbm_path)
     obj.hide_viewport = orig_hide
     bpy.ops.object.select_all(action="DESELECT")
 
@@ -461,14 +335,11 @@ def _export_fbx(obj, fbx_path):
 # ===========================================================================
 
 def _run_export_in_background(blend_path, export_data_path):
-    """
-    Launch a headless Blender instance to do the actual export.
-    This keeps the main Blender UI responsive.
-    """
-    worker_script = os.path.join(tempfile.gettempdir(), "cs2_export_worker.py")
+    import time
+    worker_script = os.path.join(tempfile.gettempdir(), f"cs2_export_worker_{int(time.time())}.py")
 
     script_content = f"""
-import bpy, sys, os, json, re, numpy as np, tempfile
+import bpy, sys, os, json, re, numpy as np, tempfile, shutil
 
 with open(r"{export_data_path}") as f:
     data = json.load(f)
@@ -477,15 +348,32 @@ exec(open(r"{os.path.abspath(__file__)}").read())
 
 context_dummy = bpy.context
 
+# Apply enabled modifiers on every mesh
+for obj in bpy.data.objects:
+    if obj.type != "MESH":
+        continue
+    for mod in list(obj.modifiers):
+        if not mod.show_viewport:
+            continue
+        try:
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+            obj.select_set(False)
+        except Exception as e:
+            print(f"WARNING: Could not apply modifier '{{mod.name}}' on '{{obj.name}}': {{e}}")
+            obj.select_set(False)
+
 for item in data["items"]:
-    col_name   = item["collection"]
-    pack_dir   = item["pack_dir"]
-    tex_size   = item["tex_size"]
-    ao_samples = item["ao_samples"]
-    do_tex     = item["do_textures"]
-    do_dec     = item["do_decimate"]
-    polys_m3   = item["polys_per_m3"]
-    max_tris   = item["max_tris"]
+    col_name    = item["collection"]
+    pack_dir    = item["pack_dir"]
+    tex_size    = item["tex_size"]
+    do_tex      = item["do_textures"]
+    do_fbx      = item["do_fbx"]
+    do_dec      = item["do_decimate"]
+    polys_m3    = item["polys_per_m3"]
+    max_tris    = item["max_tris"]
+    export_mode = item.get("export_mode", "VARIANTS")
 
     col = bpy.data.collections.get(col_name)
     if not col:
@@ -496,158 +384,134 @@ for item in data["items"]:
     asset_name   = _sanitize(col_name)
     col_dir      = os.path.join(pack_dir, asset_name)
     os.makedirs(col_dir, exist_ok=True)
-    export_mode  = item.get("export_mode", "VARIANTS")
 
     if do_dec:
         for obj in mesh_objects:
             _decimate(obj, polys_m3, max_tris, print)
 
-    # ── MODE: VARIANTS — each mesh in its own subfolder ───────────────────
+    def _export_mesh_mats(obj, folder, base_name, do_fbx, do_tex, tex_size):
+        mats = [m for m in obj.data.materials if m]
+        if not mats:
+            if do_fbx:
+                print(f"PROGRESS: {{base_name}} (no materials)")
+                _export_fbx(obj, os.path.join(folder, f"{{base_name}}.fbx"))
+            return
+        for mat in mats:
+            safe_mat = _sanitize(mat.name)
+            fbx_name = f"{{base_name}}_{{safe_mat}}"
+            print(f"PROGRESS: {{fbx_name}}")
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.duplicate()
+            d = bpy.context.active_object
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="DESELECT")
+            d.active_material_index = d.data.materials.find(mat.name)
+            bpy.ops.object.material_slot_select()
+            bpy.ops.mesh.select_all(action="INVERT")
+            bpy.ops.mesh.delete(type="FACE")
+            bpy.ops.object.mode_set(mode="OBJECT")
+            d.name = fbx_name
+            if do_fbx:
+                _export_fbx(d, os.path.join(folder, f"{{fbx_name}}.fbx"))
+            if do_tex:
+                _save_textures(_get_textures(mat), fbx_name, folder, tex_size)
+            bpy.ops.object.select_all(action="DESELECT")
+            d.select_set(True)
+            bpy.ops.object.delete()
+
+    # ── VARIANTS ─────────────────────────────────────────────────────────
     if export_mode == "VARIANTS":
+        tex_source_name = None
         for idx, obj in enumerate(mesh_objects):
             var_name = asset_name if len(mesh_objects) == 1 else f"{{asset_name}}_{{chr(ord('a')+idx)}}"
             var_dir  = os.path.join(col_dir, var_name)
             os.makedirs(var_dir, exist_ok=True)
-            _export_fbx(obj, os.path.join(var_dir, f"{{var_name}}.fbx"))
-            if do_tex:
-                mat = obj.data.materials[0] if obj.data.materials else None
-                if mat:
-                    ao = _bake_ao([obj], var_name, tex_size, ao_samples, print)
-                    _save_textures(_get_textures(mat), ao, var_name, var_dir, tex_size)
-                    if ao: bpy.data.images.remove(ao)
+            if idx == 0 or len(mesh_objects) == 1:
+                _export_mesh_mats(obj, var_dir, var_name, do_fbx, do_tex, tex_size)
+                tex_source_name = var_name
+            else:
+                _export_mesh_mats(obj, var_dir, var_name, do_fbx, False, tex_size)
+                if do_tex and tex_source_name:
+                    mats = [m for m in obj.data.materials if m]
+                    shared = {{}}
+                    if mats:
+                        for mat in mats:
+                            sm = _sanitize(mat.name)
+                            for slot in ["BaseColor", "Normal", "MaskMap", "ControlMask"]:
+                                shared[f"{{var_name}}_{{sm}}_{{slot}}.png"] = f"../{{tex_source_name}}/{{tex_source_name}}_{{sm}}_{{slot}}.png"
+                    else:
+                        for slot in ["BaseColor", "Normal", "MaskMap", "ControlMask"]:
+                            shared[f"{{var_name}}_{{slot}}.png"] = f"../{{tex_source_name}}/{{tex_source_name}}_{{slot}}.png"
+                    with open(os.path.join(var_dir, "settings.json"), "w") as f:
+                        json.dump({{"sharedAssets": shared}}, f, indent=2)
 
-    # ── MODE: SINGLE MESH — join all meshes into one FBX ─────────────────
+    # ── SINGLE MESH ───────────────────────────────────────────────────────
     elif export_mode == "SINGLE_MESH":
         bpy.ops.object.select_all(action="DESELECT")
         for obj in mesh_objects:
             obj.select_set(True)
         bpy.context.view_layer.objects.active = mesh_objects[0]
         bpy.ops.object.duplicate()
-        dupes = [o for o in bpy.context.selected_objects]
         bpy.ops.object.join()
         joined = bpy.context.active_object
         joined.name = asset_name
         var_dir = os.path.join(col_dir, asset_name)
         os.makedirs(var_dir, exist_ok=True)
-        _export_fbx(joined, os.path.join(var_dir, f"{{asset_name}}.fbx"))
-        if do_tex:
-            mat = joined.data.materials[0] if joined.data.materials else None
-            if mat:
-                ao = _bake_ao([joined], asset_name, tex_size, ao_samples, print)
-                _save_textures(_get_textures(mat), ao, asset_name, var_dir, tex_size)
-                if ao: bpy.data.images.remove(ao)
+        _export_mesh_mats(joined, var_dir, asset_name, do_fbx, do_tex, tex_size)
+        bpy.ops.object.select_all(action="DESELECT")
+        joined.select_set(True)
         bpy.ops.object.delete()
 
-    # ── MODE: SPLIT PER MATERIAL — one FBX per material slot ─────────────
+    # ── SPLIT PER MATERIAL ────────────────────────────────────────────────
     elif export_mode == "SPLIT_MATERIAL":
-        # Collect all unique materials across all meshes
-        mats_seen = {{}}
+        bpy.ops.object.select_all(action="DESELECT")
         for obj in mesh_objects:
-            for mat in obj.data.materials:
-                if mat and mat.name not in mats_seen:
-                    mats_seen[mat.name] = mat
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = mesh_objects[0]
+        bpy.ops.object.duplicate()
+        bpy.ops.object.join()
+        joined = bpy.context.active_object
+        joined.name = asset_name
+        _export_mesh_mats(joined, col_dir, asset_name, do_fbx, do_tex, tex_size)
+        bpy.ops.object.select_all(action="DESELECT")
+        joined.select_set(True)
+        bpy.ops.object.delete()
 
-        for mat_name, mat in mats_seen.items():
-            safe_mat = _sanitize(mat_name)
-            fbx_name = f"{{asset_name}}_{{safe_mat}}"
-
-            # Duplicate objects that use this material and separate by material
-            bpy.ops.object.select_all(action="DESELECT")
-            relevant = [o for o in mesh_objects if mat_name in [m.name for m in o.data.materials if m]]
-            if not relevant:
-                continue
-            for obj in relevant:
-                obj.select_set(True)
-            bpy.context.view_layer.objects.active = relevant[0]
-            bpy.ops.object.duplicate()
-            dupes = list(bpy.context.selected_objects)
-
-            # Separate by material on each dupe
-            for d in dupes:
-                bpy.context.view_layer.objects.active = d
-                bpy.ops.object.mode_set(mode="EDIT")
-                bpy.ops.mesh.select_all(action="DESELECT")
-                # Select faces with this material
-                d.active_material_index = d.data.materials.find(mat_name)
-                bpy.ops.object.material_slot_select()
-                bpy.ops.mesh.select_all(action="INVERT")
-                bpy.ops.mesh.delete(type="FACE")
-                bpy.ops.object.mode_set(mode="OBJECT")
-
-            # Join dupes into one
-            bpy.ops.object.select_all(action="DESELECT")
-            for d in dupes:
-                d.select_set(True)
-            bpy.context.view_layer.objects.active = dupes[0]
-            if len(dupes) > 1:
-                bpy.ops.object.join()
-            joined = bpy.context.active_object
-            joined.name = fbx_name
-
-            # Export into col_dir (no subfolder — CS2 combines them)
-            _export_fbx(joined, os.path.join(col_dir, f"{{fbx_name}}.fbx"))
-
-            if do_tex:
-                ao = _bake_ao([joined], fbx_name, tex_size, ao_samples, print)
-                _save_textures(_get_textures(mat), ao, fbx_name, col_dir, tex_size)
-                if ao: bpy.data.images.remove(ao)
-
-            bpy.ops.object.delete()
-
-    # ── MODE: AGING TREE — child collections as age stages ───────────────
+    # ── AGING TREE ────────────────────────────────────────────────────────
     if export_mode == "AGING_TREE":
-        aging_stages = {"Child", "Teen", "Adult", "Elderly", "Dead", "Stump"}
+        aging_stages = {{"Child", "Teen", "Adult", "Elderly", "Dead", "Stump"}}
         def _base(n):
             import re as _re2
-            return _re2.sub(r'\.\d+$', '', n)
-
+            return _re2.sub(r'\\.\\d+$', '', n)
         for child_col in col.children:
             if _base(child_col.name) not in aging_stages:
-                print(f"WARNING: Skipping invalid stage '{{child_col.name}}'")
                 continue
             stage_meshes = [o for o in child_col.objects if o.type == "MESH"]
             if not stage_meshes:
                 continue
-
-            # CS2 naming: assetName + "Tree" + stageName
-            # e.g. quivertree02 + Tree + Adult = quivertree02TreeAdult
             stage_name = f"{{asset_name}}Tree{{_base(child_col.name)}}"
             stage_dir  = os.path.join(col_dir, stage_name)
             os.makedirs(stage_dir, exist_ok=True)
-
             if do_dec:
                 for obj in stage_meshes:
                     _decimate(obj, polys_m3, max_tris, print)
-
-            # Join stage meshes if multiple
             if len(stage_meshes) == 1:
-                export_obj = stage_meshes[0]
-                _export_fbx(export_obj, os.path.join(stage_dir, f"{{stage_name}}.fbx"))
-                if do_tex:
-                    mat = export_obj.data.materials[0] if export_obj.data.materials else None
-                    if mat:
-                        ao = _bake_ao([export_obj], stage_name, tex_size, ao_samples, print)
-                        _save_textures(_get_textures(mat), ao, stage_name, stage_dir, tex_size)
-                        if ao: bpy.data.images.remove(ao)
+                _export_mesh_mats(stage_meshes[0], stage_dir, stage_name, do_fbx, do_tex, tex_size)
             else:
                 bpy.ops.object.select_all(action="DESELECT")
                 for obj in stage_meshes:
                     obj.select_set(True)
                 bpy.context.view_layer.objects.active = stage_meshes[0]
                 bpy.ops.object.duplicate()
-                dupes = list(bpy.context.selected_objects)
                 bpy.ops.object.join()
                 joined = bpy.context.active_object
                 joined.name = stage_name
-                _export_fbx(joined, os.path.join(stage_dir, f"{{stage_name}}.fbx"))
-                if do_tex:
-                    mat = joined.data.materials[0] if joined.data.materials else None
-                    if mat:
-                        ao = _bake_ao([joined], stage_name, tex_size, ao_samples, print)
-                        _save_textures(_get_textures(mat), ao, stage_name, stage_dir, tex_size)
-                        if ao: bpy.data.images.remove(ao)
+                _export_mesh_mats(joined, stage_dir, stage_name, do_fbx, do_tex, tex_size)
+                bpy.ops.object.select_all(action="DESELECT")
+                joined.select_set(True)
                 bpy.ops.object.delete()
-
             print(f"  Stage done: {{stage_name}}")
 
     print(f"Done: {{col_name}} ({{export_mode}})")
@@ -657,14 +521,8 @@ print("EXPORT_COMPLETE")
     with open(worker_script, 'w') as f:
         f.write(script_content)
 
-    cmd = [
-        bpy.app.binary_path,
-        "--background",
-        blend_path,
-        "--python", worker_script,
-    ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+    cmd = [bpy.app.binary_path, "--background", blend_path, "--python", worker_script]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 # ===========================================================================
@@ -676,23 +534,32 @@ class CS2_OT_ExportAssetPack(Operator):
     bl_label       = "Export Asset Pack"
     bl_description = "Export all collections as CS2-ready asset packs (background process)"
 
-    _process  = None
-    _timer    = None
-    _log_path = None
+    _process = None
+    _timer   = None
 
     def modal(self, context, event):
         if event.type == "TIMER":
             if self._process.poll() is not None:
                 output = self._process.stdout.read()
+                context.scene.cs2_export_running = False
                 if "EXPORT_COMPLETE" in output:
                     self.report({"INFO"}, "CS2 Export completed!")
                 else:
                     self.report({"WARNING"}, "Export finished with warnings — check console.")
+                    print(output)
                 context.window_manager.event_timer_remove(self._timer)
                 context.workspace.status_text_set(None)
                 return {"FINISHED"}
             context.workspace.status_text_set("CS2 Export running in background...")
         return {"PASS_THROUGH"}
+
+    def cancel(self, context):
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+        context.window_manager.event_timer_remove(self._timer)
+        context.workspace.status_text_set(None)
+        context.scene.cs2_export_running = False
+        self.report({"WARNING"}, "CS2 Export cancelled.")
 
     def execute(self, context):
         s             = context.scene.cs2_pack_settings
@@ -705,7 +572,6 @@ class CS2_OT_ExportAssetPack(Operator):
 
         pack_dir = os.path.join(export_folder, pack_name)
         os.makedirs(pack_dir, exist_ok=True)
-
         _sync_ignore_list(context)
 
         collections = [
@@ -718,10 +584,8 @@ class CS2_OT_ExportAssetPack(Operator):
             self.report({"WARNING"}, "No exportable collections found.")
             return {"CANCELLED"}
 
-        # Validate Aging Tree collections before export
         for col in collections:
-            mode = next((e.export_mode for e in context.scene.cs2_collection_ignores
-                        if e.name == col.name), "VARIANTS")
+            mode = next((e.export_mode for e in context.scene.cs2_collection_ignores if e.name == col.name), "VARIANTS")
             if mode == "AGING_TREE":
                 valid, errors = _validate_aging_tree(col)
                 if not valid:
@@ -729,11 +593,9 @@ class CS2_OT_ExportAssetPack(Operator):
                         self.report({"ERROR"}, err)
                     return {"CANCELLED"}
 
-        # Save blend file to temp so background Blender can open it
         tmp_blend = os.path.join(tempfile.gettempdir(), "cs2_export_tmp.blend")
         bpy.ops.wm.save_as_mainfile(filepath=tmp_blend, copy=True)
 
-        # Write export data JSON
         export_data = {
             "items": [
                 {
@@ -741,8 +603,8 @@ class CS2_OT_ExportAssetPack(Operator):
                     "export_mode":  next((e.export_mode for e in context.scene.cs2_collection_ignores if e.name == col.name), "VARIANTS"),
                     "pack_dir":     pack_dir,
                     "tex_size":     int(s.texture_size),
-                    "ao_samples":   s.ao_samples,
                     "do_textures":  s.export_textures,
+                    "do_fbx":       s.export_fbx,
                     "do_decimate":  s.do_decimate,
                     "polys_per_m3": s.polys_per_m3,
                     "max_tris":     s.max_tris,
@@ -757,8 +619,29 @@ class CS2_OT_ExportAssetPack(Operator):
         self._process = _run_export_in_background(tmp_blend, data_path)
         self._timer   = context.window_manager.event_timer_add(1.0, window=context.window)
         context.window_manager.modal_handler_add(self)
+        context.scene.cs2_export_running = True
         self.report({"INFO"}, f"Exporting {len(collections)} collection(s) in background...")
         return {"RUNNING_MODAL"}
+
+
+# ===========================================================================
+# CANCEL EXPORT OPERATOR
+# ===========================================================================
+
+class CS2_OT_CancelExport(Operator):
+    bl_idname      = "cs2.cancel_export"
+    bl_label       = "Cancel Export"
+    bl_description = "Cancel the running background export"
+
+    def execute(self, context):
+        for op in context.window_manager.operators:
+            if op.bl_idname == "CS2_OT_export_asset_pack":
+                if hasattr(op, "_process") and op._process and op._process.poll() is None:
+                    op._process.terminate()
+        context.scene.cs2_export_running = False
+        context.workspace.status_text_set(None)
+        self.report({"WARNING"}, "CS2 Export cancelled.")
+        return {"FINISHED"}
 
 
 # ===========================================================================
@@ -774,10 +657,8 @@ class CS2_OT_OpenExportFolder(Operator):
         s      = context.scene.cs2_pack_settings
         folder = _resolve_export_folder(context)
         target = os.path.join(folder, s.pack_name) if folder else ""
-
         if not target or not os.path.exists(target):
             target = folder
-
         if os.path.exists(target):
             if sys.platform == "win32":
                 os.startfile(target)
@@ -800,32 +681,25 @@ class CS2_OT_CreateAgingTreeStructure(Operator):
     bl_description = "Create Child/Teen/Adult/Elderly/Dead/Stump sub-collections in the selected collection"
 
     def execute(self, context):
-        # Find the active collection in the outliner
         active_col = context.view_layer.active_layer_collection.collection
-
         if not active_col or active_col == context.scene.collection:
             self.report({"ERROR"}, "Select a collection in the Outliner first (not Scene Collection).")
             return {"CANCELLED"}
-
         created = []
         for stage in sorted(AGING_TREE_STAGES):
             if stage not in [c.name for c in active_col.children]:
                 new_col = bpy.data.collections.new(stage)
                 active_col.children.link(new_col)
                 created.append(stage)
-
         if created:
             self.report({"INFO"}, f"Created: {', '.join(created)} in '{active_col.name}'")
         else:
             self.report({"INFO"}, "All stages already exist.")
-
-        # Set export mode to AGING_TREE for this collection
         _sync_ignore_list(context)
         for entry in context.scene.cs2_collection_ignores:
             if entry.name == active_col.name:
                 entry.export_mode = "AGING_TREE"
                 break
-
         return {"FINISHED"}
 
 
@@ -855,24 +729,17 @@ class CS2_PT_ExportPanel(Panel):
         s      = context.scene.cs2_pack_settings
         prefs  = context.preferences.addons[__name__].preferences
 
-        # ── Pack settings ───────────────────────────────────────────────────
         box = layout.box()
         box.label(text="Pack Settings", icon="PACKAGE")
         box.prop(s, "pack_name")
-
-        # Show resolved export folder
         folder = _resolve_export_folder(context)
         if folder:
             box.label(text=f"→ {folder}", icon="FILE_FOLDER")
         else:
             box.label(text="No export folder set!", icon="ERROR")
-
         box.prop(s, "export_folder_override", text="Override Folder")
-        box.operator("preferences.addon_show",
-                     text="Set Default Folder in Preferences",
-                     icon="PREFERENCES").module = __name__
+        box.operator("preferences.addon_show", text="Set Default Folder in Preferences", icon="PREFERENCES").module = __name__
 
-        # ── Export options ──────────────────────────────────────────────────
         box2 = layout.box()
         box2.label(text="Export Options", icon="PREFERENCES")
         box2.prop(s, "texture_size")
@@ -880,12 +747,6 @@ class CS2_PT_ExportPanel(Panel):
         row.prop(s, "export_fbx",      icon="EXPORT")
         row.prop(s, "export_textures", icon="IMAGE_DATA")
 
-        if s.export_textures:
-            ao = box2.box()
-            ao.label(text="AO Bake (Cycles)", icon="LIGHT_SUN")
-            ao.prop(s, "ao_samples")
-
-        # ── Decimation ──────────────────────────────────────────────────────
         box3 = layout.box()
         row  = box3.row()
         row.prop(s, "do_decimate", icon="MOD_DECIM")
@@ -893,12 +754,10 @@ class CS2_PT_ExportPanel(Panel):
             box3.prop(s, "polys_per_m3")
             box3.prop(s, "max_tris")
 
-        # ── Collections ─────────────────────────────────────────────────────
         box4 = layout.box()
         row  = box4.row()
         row.label(text="Collections", icon="OUTLINER_COLLECTION")
         row.operator("cs2.sync_collections", text="", icon="FILE_REFRESH")
-
         ig_list = context.scene.cs2_collection_ignores
         if not ig_list:
             box4.label(text="Press ↻ to load", icon="INFO")
@@ -920,7 +779,6 @@ class CS2_PT_ExportPanel(Panel):
                     row.label(text=f"{mesh_count} mesh(es)")
                     col_box.prop(entry, "export_mode", text="")
 
-        # ── Output preview ──────────────────────────────────────────────────
         if folder and s.pack_name:
             box5 = layout.box()
             box5.label(text="Output structure:", icon="FILEBROWSER")
@@ -934,19 +792,17 @@ class CS2_PT_ExportPanel(Panel):
                 mode  = next((e.export_mode for e in ig_list if e.name == col.name), "VARIANTS")
                 mesh_count = sum(1 for o in col.objects if o.type == "MESH")
                 box5.label(text=f"  {aname}/  [{mode}]", icon="OUTLINER_COLLECTION")
-
                 if mode == "AGING_TREE":
                     for child in col.children:
                         stage = f"{aname}Tree{child.name}"
-                        icon  = "CHECKMARK" if child.name in AGING_TREE_STAGES else "ERROR"
-                        box5.label(text=f"    {stage}/", icon=icon)
+                        ico   = "CHECKMARK" if child.name in AGING_TREE_STAGES else "ERROR"
+                        box5.label(text=f"    {stage}/", icon=ico)
                 elif mode == "VARIANTS":
                     if mesh_count == 1:
                         box5.label(text=f"    {aname}/  (1 mesh)", icon="OBJECT_DATA")
                     else:
                         for i in range(min(mesh_count, 3)):
-                            suffix = chr(ord('a') + i)
-                            box5.label(text=f"    {aname}_{suffix}/", icon="OBJECT_DATA")
+                            box5.label(text=f"    {aname}_{chr(ord('a')+i)}/", icon="OBJECT_DATA")
                         if mesh_count > 3:
                             box5.label(text=f"    ... +{mesh_count-3} more")
                 elif mode == "SPLIT_MATERIAL":
@@ -963,11 +819,12 @@ class CS2_PT_ExportPanel(Panel):
                     box5.label(text=f"    {aname}/  (merged)", icon="OBJECT_DATA")
 
         layout.separator()
-
-        # ── Export button ───────────────────────────────────────────────────
         row = layout.row()
         row.scale_y = 1.6
-        row.operator("cs2.export_asset_pack", icon="EXPORT")
+        if context.scene.get("cs2_export_running"):
+            row.operator("cs2.cancel_export", icon="X", text="Cancel Export")
+        else:
+            row.operator("cs2.export_asset_pack", icon="EXPORT")
         layout.operator("cs2.open_export_folder", icon="FILE_FOLDER")
 
 
@@ -982,6 +839,7 @@ classes = (
     CS2_OT_CreateAgingTreeStructure,
     CS2_OT_SyncCollections,
     CS2_OT_ExportAssetPack,
+    CS2_OT_CancelExport,
     CS2_OT_OpenExportFolder,
     CS2_PT_ExportPanel,
 )
@@ -992,6 +850,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.cs2_pack_settings      = PointerProperty(type=CS2PackSettings)
     bpy.types.Scene.cs2_collection_ignores = CollectionProperty(type=CS2CollectionIgnore)
+    bpy.types.Scene.cs2_export_running     = BoolProperty(default=False)
 
 
 def unregister():
@@ -999,6 +858,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.cs2_pack_settings
     del bpy.types.Scene.cs2_collection_ignores
+    del bpy.types.Scene.cs2_export_running
 
 
 if __name__ == "__main__":
