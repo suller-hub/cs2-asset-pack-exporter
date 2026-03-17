@@ -29,55 +29,49 @@ Press **↻** to sync the collection list, then pick an export mode per collecti
 Click **Export Asset Pack**. The export runs in a **background Blender instance** so your main Blender stays responsive.
 
 ### 4. Import in CS2
-Open the CS2 Editor → Asset Importer. Set **Project Root** to your pack folder and **Assets Folder** to the asset subfolder.
+Open the CS2 Editor → Asset Importer. For all modes: point the Assets Folder to the **asset root folder** (`assetname/`). CS2 handles the rest automatically.
 
 ---
 
 ## Export Modes
 
+All modes automatically split meshes by material — one FBX per material slot. The mode only controls the folder structure.
+
 ### Variants
-Each mesh object in the collection gets its own subfolder. Use this for assets with multiple shape variations (e.g. rocks, bushes).
+Each mesh object gets its own subfolder. Use this for assets with multiple shape variations (e.g. rocks, bushes, plants).
 
 ```
-MyRockPack/
-└── boulder01/
-    ├── boulder01_a/
-    │   ├── boulder01_a.fbx
-    │   ├── boulder01_a_BaseColor.png
+MyPack/
+└── assetname/                 ← point CS2 here
+    ├── assetname_a/
+    │   ├── assetname_a_material1.fbx
+    │   ├── assetname_a_material1_BaseColor.png
+    │   ├── assetname_a_material2.fbx
     │   └── ...
-    └── boulder01_b/
+    ├── assetname_b/
+    │   ├── assetname_b_material1.fbx
+    │   └── settings.json
+    └── assetname_c/
         └── ...
 ```
 
-Import each subfolder separately in CS2. Then manually link them as mesh variations in the Asset Editor via the Object Info Panel.
+CS2 imports each subfolder as a separate asset automatically. In the Asset Editor, manually link them as mesh variations via the Object Info Panel.
+
+The first variant exports real textures. All subsequent variants share textures via `settings.json` — no duplicate texture files.
 
 ---
 
 ### Single Mesh
-All mesh objects in the collection are joined into one FBX. Use this for simple props with a single material.
+All mesh objects in the collection are joined, then split by material into one folder.
 
 ```
-MyRockPack/
-└── boulder01/
-    └── boulder01/
-        ├── boulder01.fbx
-        └── textures...
-```
-
----
-
-### Split per Material
-One FBX per material slot, all in the same folder. CS2 combines them into one mesh on import. Use this for assets with multiple materials (e.g. a tree with separate bark/leaves/branches materials).
-
-```
-MyTreePack/
-└── jacarandatree/
-    ├── jacarandatree_branches.fbx
-    ├── jacarandatree_trunk.fbx
-    ├── jacarandatree_leaves.fbx
-    ├── jacarandatree_branches_BaseColor.png
-    ├── jacarandatree_trunk_BaseColor.png
-    └── ...
+MyPack/
+└── assetname/                 ← point CS2 here
+    └── assetname/
+        ├── assetname_material1.fbx
+        ├── assetname_material1_BaseColor.png
+        ├── assetname_material2.fbx
+        └── ...
 ```
 
 ---
@@ -89,8 +83,8 @@ For CS2's **Aging Tree** prefab preset. Organise your meshes in sub-collections 
 
 ```
 Blender Outliner:
-└── quivertree02          ← collection, mode = Aging Tree
-    ├── Child             ← sub-collection (auto-created)
+└── assetname          ← collection, mode = Aging Tree
+    ├── Child          ← sub-collection (auto-created)
     ├── Teen
     ├── Adult
     ├── Elderly
@@ -100,33 +94,31 @@ Blender Outliner:
 
 Output:
 ```
-MyTreePack/
-└── quivertree02/
-    ├── quivertree02TreeChild/
-    │   ├── quivertree02TreeChild.fbx
+MyPack/
+└── assetname/                 ← point CS2 here
+    ├── assetnameTreeChild/
+    │   ├── assetnameTreeChild_material1.fbx
     │   └── textures...
-    ├── quivertree02TreeAdult/
+    ├── assetnameTreeAdult/
     └── ...
 ```
 
-In CS2 Asset Importer: set **Prefab Preset** to **Aging Tree** and point the Assets Folder to `quivertree02/`.
+In CS2 Asset Importer: set **Prefab Preset** to **Aging Tree**.
+
+---
+
+## Modifiers
+
+All modifiers that are **enabled in the viewport** (eye icon on) are applied before export. Disabled modifiers are skipped. The export runs on a temporary copy of the blend file so your originals are never touched.
 
 ---
 
 ## Texture Algorithm
 
-The addon tries to extract textures from materials using two strategies in order:
+The addon extracts textures from materials using two strategies in order:
 
 ### Strategy 1 — Principled BSDF sockets
 Standard Blender PBR workflow. Reads directly from the socket inputs of a Principled BSDF node.
-
-| CS2 Slot | Principled BSDF Socket |
-|----------|----------------------|
-| BaseColor | Base Color |
-| Normal | Normal |
-| MaskMap R | Metallic |
-| MaskMap A (Smoothness) | 1 − Roughness |
-| MaskMap G (AO) | Baked via Cycles |
 
 ### Strategy 2 — Frame label / filename keyword scan
 Used when the material has a custom shader (e.g. Poly Haven, PBRPX). Scans all Image Texture nodes and matches them by the **name of their enclosing frame node** or the **image filename**.
@@ -139,21 +131,20 @@ Used when the material has a custom shader (e.g. Poly Haven, PBRPX). Scans all I
 | Metallic | `metallic` `metal` `met` `_m.` `_mt` |
 
 ### CS2 MaskMap packing
-CS2 uses a packed texture for PBR data:
 
 | Channel | Data |
 |---------|------|
 | R | Metallic |
-| G | Ambient Occlusion (baked via Cycles) |
-| B | Detail mask (always 1.0) |
-| A | Smoothness (1 − Roughness) |
+| G | Coat (0 = no coat) |
+| B | Unused (always black) |
+| A | Glossiness (1 − Roughness) |
 
 ### Adding custom keywords
-If your asset library uses different naming conventions, you can extend the keyword lists directly in the script — find `kw_map` in `_get_textures()`:
+Find `kw_map` in `_get_textures()` and extend the lists:
 
 ```python
 kw_map = {
-    "base_color": ["base color", "basecolor", "albedo", "diffuse", "diff", ...],
+    "base_color": ["base color", "basecolor", "albedo", ...],
     "normal":     ["normal", "nrm", "nor_gl", ...],
     "roughness":  ["roughness", "rough", ...],
     "metallic":   ["metallic", "metal", ...],
@@ -164,21 +155,7 @@ kw_map = {
 
 ## Scale & Rotation
 
-CS2 runs on Unity which applies a **0.01 import scale factor** to FBX files (treats units as centimeters). The addon compensates by physically scaling the mesh 100x before export and restoring it afterward, so a 1m object in Blender arrives as 1m in CS2.
-
-Rotation is handled via `bake_space_transform=True` with `axis_forward="-Z", axis_up="Y"`, converting Blender's Z-up coordinate system to Unity's Y-up.
-
----
-
-## AO Baking
-
-Ambient Occlusion is baked automatically via **Cycles** before texture export. You can control the quality with the **AO Samples** setting:
-
-| Samples | Quality |
-|---------|---------|
-| 4-16 | Fast preview |
-| 32-64 | Good |
-| 128+ | High quality |
+Scale is handled via `apply_scale_options="FBX_SCALE_NONE"` and `bake_space_transform=True`. Rotation is converted from Blender's Z-up to Unity's Y-up via `axis_forward="-Z", axis_up="Y"`.
 
 ---
 
